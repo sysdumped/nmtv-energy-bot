@@ -1,0 +1,534 @@
+# =====================================================================
+#  NM-TV-154 "Energy Bot" - ESPHome - occhi robot + consumi di casa
+#  Hardware: NMMiner NM-TV-154 (ESP32-D0WD-V3, ST7789 240x240 SPI)
+#  L'umore segue la potenza prelevata dalla rete (soglie sul contatore),
+#  in basso: barra a segmenti, potenza istantanea, energia di oggi e FV.
+# =====================================================================
+
+substitutions:
+  # >>> ADATTA AI TUOI ENTITY ID <<<
+  power_entity: sensor.grid_power              # W: + prelievo, - immissione
+  solar_entity: sensor.solar_power             # W, opzionale
+  energy_today_entity: sensor.energy_today     # kWh, opzionale
+  power_multiplier: "1"     # 1000 se il sensore è in kW, -1 se il segno è invertito
+  max_power_w: "3000"       # potenza contrattuale (allarme sopra il 97%)
+  touch_pin: GPIO4          # da verificare come sull'altro cubo
+
+esphome:
+  name: nmtv-energy
+  friendly_name: NM-TV Energy
+  on_boot:
+    - priority: 800
+      then:
+        - switch.turn_on: lcd_power
+
+esp32:
+  board: esp32dev
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret energy_api_key
+  # Azione HA: esphome.nmtv_energy_reazione
+  # tipo: sorpresa | sbadiglio | occhiolino | sospettoso | sollievo
+  actions:
+    - action: reazione
+      variables:
+        tipo: string
+      then:
+        - lambda: |-
+            static const char *const N[] = {"sorpresa", "sbadiglio", "occhiolino",
+                                            "sospettoso", "sollievo"};
+            for (int i = 0; i < 5; i++) {
+              if (tipo == N[i]) {
+                id(react) = i;
+                id(react_start) = millis();
+                id(react_until) = 0;
+              }
+            }
+
+ota:
+  - platform: esphome
+    password: !secret energy_ota_password
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+time:
+  - platform: homeassistant
+    id: hatime
+
+# ---------------------------------------------------------------------
+#  Stato interno
+# ---------------------------------------------------------------------
+globals:
+  # 0 surplus FV | 1 calmo | 2 normale | 3 impegnato
+  # 4 preoccupato | 5 allarme | 6 assonnato
+  - id: eff_mood
+    type: int
+    initial_value: '2'
+  - id: level                # livello carico con isteresi: 0..4
+    type: int
+    initial_value: '1'
+  - id: p_smooth             # potenza filtrata per umore e barra
+    type: float
+    initial_value: 'NAN'
+  - id: p_ref                # ultimo valore, per rilevare gli scalini
+    type: float
+    initial_value: 'NAN'
+  - id: gauge                # riempimento animato della barra 0..1
+    type: float
+    initial_value: '0'
+  - id: petted_until
+    type: uint32_t
+    initial_value: '0'
+  # [0]larghezza [1]altezza [2]palpebra sup [3]inclinazione [4]palpebra inf
+  # [5..7]colore RGB [8]sguardo X [9]sguardo Y
+  # [10]scala occhio sx [11]scala occhio dx [12]stretch da movimento
+  - id: st
+    type: std::vector<float>
+    initial_value: '{62, 66, 0, 0, 0, 0, 210, 255, 0, 0, 1, 1, 0}'
+  - id: vel
+    type: std::vector<float>
+    initial_value: '{0, 0, 0, 0, 0}'
+  - id: look_tx
+    type: float
+    initial_value: '0'
+  - id: look_ty
+    type: float
+    initial_value: '0'
+  - id: next_look
+    type: uint32_t
+    initial_value: '0'
+  # Reazioni: -1 nessuna | 0 sorpresa (guarda la barra) | 1 sbadiglio
+  #           2 occhiolino | 3 sospettoso | 4 sollievo
+  - id: react
+    type: int
+    initial_value: '-1'
+  - id: react_start
+    type: uint32_t
+    initial_value: '0'
+  - id: react_until
+    type: uint32_t
+    initial_value: '0'
+  - id: next_react
+    type: uint32_t
+    initial_value: '20000'
+
+# ---------------------------------------------------------------------
+#  Dati da Home Assistant
+# ---------------------------------------------------------------------
+sensor:
+  - platform: homeassistant
+    id: grid_power
+    entity_id: ${power_entity}
+    filters:
+      - multiply: ${power_multiplier}
+    on_value:
+      - lambda: |-
+          // scalino di potenza: qualcosa si è acceso / spento
+          float prev = id(p_ref);
+          if (!isnan(prev) && millis() > id(petted_until)) {
+            if (x - prev >= 800.0f)      { id(react) = 0; id(react_start) = millis(); id(react_until) = 0; }
+            else if (prev - x >= 800.0f) { id(react) = 4; id(react_start) = millis(); id(react_until) = 0; }
+          }
+          id(p_ref) = x;
+  - platform: homeassistant
+    id: solar_power
+    entity_id: ${solar_entity}
+  - platform: homeassistant
+    id: energy_today
+    entity_id: ${energy_today_entity}
+
+select:
+  - platform: template
+    id: mood_override
+    name: "Umore"
+    optimistic: true
+    initial_option: "Auto"
+    options:
+      - "Auto"
+      - "Surplus FV"
+      - "Calmo"
+      - "Normale"
+      - "Impegnato"
+      - "Preoccupato"
+      - "Allarme"
+      - "Assonnato"
+
+# ---------------------------------------------------------------------
+#  Hardware
+# ---------------------------------------------------------------------
+switch:
+  - platform: gpio
+    id: lcd_power
+    pin: GPIO21
+    inverted: true
+    restore_mode: ALWAYS_ON
+    internal: true
+
+binary_sensor:
+  - platform: gpio
+    id: btn_touch
+    name: "Coccola"
+    pin:
+      number: ${touch_pin}
+      inverted: false
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - lambda: |-
+          id(petted_until) = millis() + 2500;
+          id(react) = 2;                     // occhiolino quando lo tocchi
+          id(react_start) = millis();
+          id(react_until) = 0;
+
+output:
+  - platform: ledc
+    id: bl_pwm
+    pin: GPIO19
+    inverted: true
+    frequency: 2000
+
+light:
+  - platform: monochromatic
+    output: bl_pwm
+    name: Retroilluminazione
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+
+spi:
+  clk_pin: GPIO14
+  mosi_pin: GPIO13
+
+font:
+  - file: "gfonts://Roboto@700"
+    id: font_big
+    size: 34
+  - file: "gfonts://Roboto@500"
+    id: font_info
+    size: 15
+  - file: "gfonts://Roboto@700"
+    id: font_zz
+    size: 22
+
+# ---------------------------------------------------------------------
+#  Motore di animazione (~30 fps)
+# ---------------------------------------------------------------------
+interval:
+  - interval: 33ms
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          const float MAXP = ${max_power_w};
+
+          // ---------- potenza filtrata -> livello con isteresi ----------
+          float pw = id(grid_power).has_state() ? id(grid_power).state : NAN;
+          if (!isnan(pw)) {
+            if (isnan(id(p_smooth))) id(p_smooth) = pw;
+            id(p_smooth) += (pw - id(p_smooth)) * 0.05f;
+          }
+          float ps = id(p_smooth);
+          int m = 2;
+          if (!isnan(ps)) {
+            if (ps < -100.0f) {
+              m = 0;
+              id(level) = 0;
+            } else {
+              static const float TH[4] = {0.15f, 0.50f, 0.80f, 0.97f};
+              float f = ps / MAXP;
+              int lvl = 0;
+              for (int i = 0; i < 4; i++) if (f > TH[i]) lvl = i + 1;
+              int prev = id(level);
+              if (prev > 0 && lvl < prev && f > TH[prev - 1] - 0.04f) lvl = prev;
+              id(level) = lvl;
+              m = lvl + 1;
+              if (lvl == 0) {
+                auto t = id(hatime).now();
+                if (t.is_valid() && (t.hour < 6 || t.hour >= 23)) m = 6;
+              }
+            }
+          }
+          auto idx = id(mood_override).active_index();
+          if (idx.has_value() && *idx > 0) m = (int) *idx - 1;
+          id(eff_mood) = m;
+
+          // barra: segue la potenza (in surplus mostra l'immissione)
+          float gt = isnan(ps) ? 0.0f : std::min(1.0f, fabsf(ps) / MAXP);
+          if (idx.has_value() && *idx > 0) {
+            static const float DEMO[7] = {0.2f, 0.08f, 0.32f, 0.65f, 0.88f, 1.0f, 0.04f};
+            gt = DEMO[m];
+          }
+          id(gauge) += (gt - id(gauge)) * 0.12f;
+
+          //            W    H    lid    tilt  bottom   R    G    B
+          static const float T[7][8] = {
+            {64, 66, 0.00f,  0.00f, 0.38f,  40, 230, 120},  // surplus FV
+            {64, 54, 0.30f,  0.00f, 0.00f,   0, 180, 220},  // calmo
+            {62, 66, 0.00f,  0.00f, 0.00f,   0, 210, 255},  // normale
+            {66, 50, 0.30f, -0.40f, 0.00f, 255, 175,  40},  // impegnato
+            {54, 74, 0.05f,  0.65f, 0.00f, 255, 110,  40},  // preoccupato
+            {50, 82, 0.00f,  0.00f, 0.00f, 255,  40,  40},  // allarme
+            {66,  7, 0.00f,  0.00f, 0.00f,   0,  90, 120},  // assonnato
+          };
+          static const uint32_t DUR[5] = {1800, 2400, 1000, 2800, 1500};
+
+          float tgt[8];
+          for (int i = 0; i < 8; i++) tgt[i] = T[m][i];
+          float scaleL = 1.0f, scaleR = 1.0f;
+
+          // ---------- reazioni ----------
+          int r = id(react);
+          if (r >= 0 && id(react_until) == 0) id(react_until) = id(react_start) + DUR[r];
+          if (r >= 0 && now > id(react_until)) {
+            r = -1;
+            id(react) = -1;
+            id(next_react) = now + 25000 + random_uint32() % 45000;
+          }
+          if (r < 0 && now > id(next_react)) {
+            int pick = -1;
+            bool coin = random_uint32() % 2;
+            switch (m) {
+              case 0: pick = 2; break;
+              case 1: pick = coin ? 1 : 2; break;
+              case 2: pick = coin ? 3 : 2; break;
+              default: break;
+            }
+            if (pick >= 0) {
+              r = pick;
+              id(react) = pick;
+              id(react_start) = now;
+              id(react_until) = now + DUR[pick];
+            } else {
+              id(next_react) = now + 30000;
+            }
+          }
+          float p = 0;
+          if (r >= 0) {
+            p = (now - id(react_start)) / (float) DUR[r];
+            switch (r) {
+              case 0: tgt[0] = 54; tgt[1] = 84; tgt[2] = 0; tgt[3] = 0; tgt[4] = 0; break;
+              case 1: if (p < 0.75f) { tgt[0] = 78; tgt[1] = 9; tgt[2] = 0; tgt[3] = -0.5f; tgt[4] = 0; } break;
+              case 2: scaleR = 0.06f; tgt[4] = 0.35f; break;
+              case 3: tgt[1] = 36; tgt[2] = 0.15f; tgt[3] = -0.45f; tgt[4] = 0; break;
+              case 4: tgt[1] = 64; tgt[2] = 0; tgt[3] = 0; tgt[4] = 0.40f;
+                      tgt[5] = 60; tgt[6] = 230; tgt[7] = 150; break;
+            }
+          }
+
+          // ---------- molle per la forma ----------
+          auto &s = id(st);
+          auto &v = id(vel);
+          const float K = 0.16f, D = 0.70f;
+          for (int i = 0; i < 5; i++) {
+            v[i] += (tgt[i] - s[i]) * K;
+            v[i] *= D;
+            s[i] += v[i];
+          }
+          if (s[1] < 3) s[1] = 3;
+          if (s[2] < 0) s[2] = 0;
+          if (s[4] < 0) s[4] = 0;
+          for (int i = 5; i < 8; i++) s[i] += (tgt[i] - s[i]) * 0.15f;
+          s[10] += (scaleL - s[10]) * 0.4f;
+          s[11] += (scaleR - s[11]) * 0.4f;
+
+          // ---------- sguardo ----------
+          if (now > id(next_look)) {
+            float range = (m == 1) ? 22.0f : (m >= 4 && m <= 5 ? 9.0f : 16.0f);
+            float rx = (random_uint32() % 1000) / 500.0f - 1.0f;
+            float ry = (random_uint32() % 1000) / 500.0f - 1.0f;
+            id(look_tx) = rx * range;
+            id(look_ty) = ry * range * 0.4f;
+            if (random_uint32() % 3 == 0 || m == 6) { id(look_tx) = 0; id(look_ty) = 0; }
+            // ogni tanto da un'occhiata alla barra dei consumi
+            if (m >= 3 && m <= 5 && random_uint32() % 2) { id(look_tx) = 0; id(look_ty) = 12; }
+            uint32_t base = (m == 1) ? 2500 : (m >= 4 ? 450 : 1400);
+            id(next_look) = now + base + random_uint32() % 2500;
+          }
+          float lx_t = id(look_tx), ly_t = id(look_ty);
+          if (r == 0) { lx_t = 0; ly_t = (p < 0.25f) ? -6 : 14; }   // sobbalza e guarda giù
+          if (r == 3) { lx_t = (p < 0.5f) ? -22 : 22; ly_t = 0; }
+          float sp = (m >= 4 || r == 3) ? 0.5f : 0.3f;
+          float dx = (lx_t - s[8]) * sp;
+          s[8] += dx;
+          s[9] += (ly_t - s[9]) * sp;
+          float stretch_t = std::min(0.25f, fabsf(dx) * 0.03f);
+          s[12] += (stretch_t - s[12]) * 0.5f;
+
+# ---------------------------------------------------------------------
+#  Display
+# ---------------------------------------------------------------------
+display:
+  - platform: mipi_spi
+    id: tft
+    model: ST7789V
+    dimensions:
+      width: 240
+      height: 240
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    spi_mode: MODE3
+    data_rate: 40MHz
+    invert_colors: true
+    color_order: rgb
+    color_depth: 16
+    buffer_size: 25%
+    update_interval: 50ms
+    lambda: |-
+      const int W = 240, H = 240, CX = 120, EY = 80;
+      uint32_t now = millis();
+      auto &s = id(st);
+      int m = id(eff_mood);
+      int r = id(react);
+      const Color bg = Color(0, 0, 0);
+      it.fill(bg);
+
+      // lampeggio in allarme
+      float pulse = 1.0f;
+      if (m == 5) pulse = 0.55f + 0.45f * fabsf(sinf(now / 160.0f));
+      auto mix = [&](float k) {
+        k *= pulse;
+        return Color((uint8_t) (s[5] * k), (uint8_t) (s[6] * k), (uint8_t) (s[7] * k));
+      };
+      const Color ec    = mix(1.0f);
+      const Color glow1 = mix(0.10f);
+      const Color glow2 = mix(0.24f);
+      const Color hl = Color((uint8_t) (s[5] + (255 - s[5]) * 0.6f),
+                             (uint8_t) (s[6] + (255 - s[6]) * 0.6f),
+                             (uint8_t) (s[7] + (255 - s[7]) * 0.6f));
+
+      auto rrect = [&](int x, int y, int w, int h, int rad, Color c) {
+        if (w <= 0 || h <= 0) return;
+        rad = std::min(rad, std::min(w, h) / 2);
+        if (rad < 1) { it.filled_rectangle(x, y, w, h, c); return; }
+        it.filled_rectangle(x + rad, y, w - 2 * rad, h, c);
+        it.filled_rectangle(x, y + rad, w, h - 2 * rad, c);
+        it.filled_circle(x + rad,         y + rad,         rad, c);
+        it.filled_circle(x + w - rad - 1, y + rad,         rad, c);
+        it.filled_circle(x + rad,         y + h - rad - 1, rad, c);
+        it.filled_circle(x + w - rad - 1, y + h - rad - 1, rad, c);
+      };
+      auto drop = [&](int x, int y, int rad, Color c) {
+        it.filled_circle(x, y, rad, c);
+        it.filled_triangle(x - rad, y - 1, x + rad, y - 1, x, y - 2 * rad - 2, c);
+      };
+
+      // battito ciglia
+      float blink = 1.0f;
+      uint32_t ph = now % 5300;
+      if (ph < 160) blink = 1.0f - 0.92f * sinf(3.14159f * ph / 160.0f);
+      else if (ph > 380 && ph < 540 && ((now / 5300) % 3) == 0)
+        blink = 1.0f - 0.92f * sinf(3.14159f * (ph - 380) / 160.0f);
+      if (m == 6 || r == 1) blink = 1.0f;
+
+      float jx = 0, jy = 0;
+      if (m == 4) { jx = sinf(now / 30.0f) * 1.5f; }
+      if (m == 5) { jx = sinf(now / 20.0f) * 3.0f; jy = cosf(now / 27.0f) * 1.5f; }
+      float breath = sinf(now / 900.0f) * 2.0f;
+
+      // ---------- occhi ----------
+      auto eye = [&](int sgn) {
+        float lx = s[8], ly = s[9];
+        float persp = 1.0f + 0.08f * (lx / 20.0f) * sgn;
+        float sc = (sgn < 0) ? s[10] : s[11];
+        float w = s[0] * persp * (1.0f + s[12] * 0.6f);
+        float h = std::max(4.0f, s[1] * blink * persp * sc * (1.0f - s[12] * 0.5f));
+        float cx = CX + sgn * 52 + lx + jx;
+        float cy = EY + ly + jy + breath;
+        int x = (int) (cx - w / 2), y = (int) (cy - h / 2);
+        int iw = (int) w, ih = (int) h;
+        int rr = (int) (std::min(w, h) * 0.32f);
+        rrect(x - 8, y - 8, iw + 16, ih + 16, rr + 8, glow1);
+        rrect(x - 4, y - 4, iw + 8,  ih + 8,  rr + 4, glow2);
+        rrect(x, y, iw, ih, rr, ec);
+        if (h > 24)
+          rrect(x + (int) (w * 0.16f), y + (int) (h * 0.12f),
+                (int) (w * 0.24f), (int) (h * 0.16f), (int) (w * 0.08f), hl);
+        float lid = s[2], tilt = s[3];
+        if (lid > 0.02f || fabsf(tilt) > 0.02f) {
+          float base = y + lid * h;
+          int yo = (int) (base + tilt * h * 0.30f);
+          int yi = (int) (base - tilt * h * 0.30f);
+          int xo = (sgn > 0) ? x + iw + 12 : x - 12;
+          int xi = (sgn > 0) ? x - 12 : x + iw + 12;
+          int top = y - 46;
+          it.filled_triangle(xo, top, xi, top, xi, yi, bg);
+          it.filled_triangle(xo, top, xi, yi, xo, yo, bg);
+        }
+        float b = s[4];
+        if (b > 0.02f) {
+          float R = w * 0.8f + 6;
+          it.filled_circle((int) cx, (int) (y + h - b * h + R), (int) R, bg);
+        }
+      };
+      eye(-1);
+      eye(1);
+
+      // ---------- dettagli per umore ----------
+      if (m == 0) {                                                  // sole che pulsa
+        int gr = 13 + (int) (sinf(now / 500.0f) * 2);
+        it.filled_circle(24, 22, gr + 5, Color(50, 40, 0));
+        it.filled_circle(24, 22, gr, Color(255, 205, 50));
+      }
+      if (m == 4)                                                    // sudore
+        drop(CX + 92, 30 + (now / 60) % 26, 5, Color(80, 170, 255));
+      if (m == 6) {                                                  // zZ
+        int zy = 34 - (int) ((now / 110) % 26);
+        it.print(CX + 70, zy, id(font_zz), Color(0, 90, 120), "z");
+        it.print(CX + 86, zy - 16, id(font_zz), Color(0, 70, 95), "Z");
+      }
+
+      // ---------- barra a segmenti ----------
+      // (disegnata dopo gli occhi: la palpebra inferiore non la cancella)
+      it.filled_rectangle(0, 136, W, H - 136, bg);
+      const int NS = 20, BY = 146, BH = 12;
+      float g = id(gauge);
+      bool export_mode = (m == 0);
+      bool flash = (m == 5) && ((now / 250) % 2 == 0);
+      for (int i = 0; i < NS; i++) {
+        int x = 21 + i * 10;
+        float t = i / (float) (NS - 1);
+        Color on;
+        if (export_mode)      on = Color(40, 230, 120);
+        else if (t < 0.5f)    on = Color((uint8_t) (40 + 430 * t), 220, (uint8_t) (120 - 200 * t));
+        else                  on = Color(255, (uint8_t) (220 - 360 * (t - 0.5f)), 20);
+        float fill = g * NS - i;
+        Color c;
+        if (fill >= 1.0f)      c = flash ? Color(90, 10, 10) : on;
+        else if (fill > 0.0f)  c = Color((uint8_t) (on.r * (0.25f + 0.75f * fill)),
+                                         (uint8_t) (on.g * (0.25f + 0.75f * fill)),
+                                         (uint8_t) (on.b * (0.25f + 0.75f * fill)));
+        else                   c = Color(28, 28, 34);
+        rrect(x, BY, 8, BH, 2, c);
+      }
+
+      // ---------- potenza istantanea ----------
+      const Color txt = Color(235, 235, 240);
+      const Color dim = Color(110, 110, 120);
+      if (id(grid_power).has_state() && !isnan(id(grid_power).state)) {
+        float pw = id(grid_power).state;
+        Color pc = (pw < -100) ? Color(60, 235, 140) : (m == 5 ? ec : txt);
+        if (fabsf(pw) < 1000)
+          it.printf(CX, 164, id(font_big), pc, TextAlign::TOP_CENTER, "%.0f W", pw);
+        else
+          it.printf(CX, 164, id(font_big), pc, TextAlign::TOP_CENTER, "%.2f kW", pw / 1000.0f);
+      } else {
+        it.print(CX, 164, id(font_big), dim, TextAlign::TOP_CENTER, "-- W");
+      }
+
+      // ---------- riga in basso: energia di oggi + fotovoltaico ----------
+      if (id(energy_today).has_state() && !isnan(id(energy_today).state))
+        it.printf(10, H - 6, id(font_info), dim, TextAlign::BOTTOM_LEFT,
+                  "oggi %.1f kWh", id(energy_today).state);
+      if (id(solar_power).has_state() && !isnan(id(solar_power).state)) {
+        float sv = id(solar_power).state;
+        Color sc = (sv > 50) ? Color(230, 190, 60) : dim;
+        if (sv < 1000)
+          it.printf(W - 10, H - 6, id(font_info), sc, TextAlign::BOTTOM_RIGHT, "FV %.0f W", sv);
+        else
+          it.printf(W - 10, H - 6, id(font_info), sc, TextAlign::BOTTOM_RIGHT, "FV %.1f kW", sv / 1000.0f);
+      }
