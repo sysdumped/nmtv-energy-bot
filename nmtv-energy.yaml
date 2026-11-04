@@ -12,7 +12,8 @@ substitutions:
   energy_today_entity: sensor.energy_today     # kWh, opzionale
   power_multiplier: "1"     # 1000 se il sensore è in kW, -1 se il segno è invertito
   max_power_w: "3000"       # potenza contrattuale (allarme sopra il 97%)
-  touch_pin: GPIO4          # da verificare come sull'altro cubo
+  touch_pin: GPIO32           # pad touch capacitivo sul tetto (T9)
+  touch_threshold: "1490"     # a riposo ~1640, col dito ~1330: scatta sotto soglia
 
 esphome:
   name: nmtv-energy
@@ -171,15 +172,21 @@ switch:
     restore_mode: ALWAYS_ON
     internal: true
 
+# Il tasto sul tetto è un pad capacitivo collegato direttamente all'ESP32.
+# Per ricalibrare: setup_mode: true, guarda i valori nel log con e senza dito
+# e metti touch_threshold a metà strada.
+esp32_touch:
+  setup_mode: false
+
 binary_sensor:
-  - platform: gpio
+  - platform: esp32_touch
     id: btn_touch
     name: "Coccola"
-    pin:
-      number: ${touch_pin}
-      inverted: false
+    pin: ${touch_pin}
+    threshold: ${touch_threshold}
     filters:
       - delayed_on: 30ms
+      - delayed_off: 50ms
     on_press:
       - lambda: |-
           id(petted_until) = millis() + 2500;
